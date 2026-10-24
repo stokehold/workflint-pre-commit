@@ -1,0 +1,78 @@
+name: Tag
+
+# Tags main v<version> and creates a GitHub release when the pinned workflint
+# version has no tag yet, so `pre-commit autoupdate` finds the new version.
+# Runs on each push to main that changes the pin, and by hand, for example
+# after a rejected deployment.
+#
+# The plan job tags only a version that PyPI has platform wheels for, so the
+# placeholder 0.0.1 never gets a tag. Creating the release publishes it, so
+# the release job runs in the release environment, which needs the
+# maintainer's approval.
+on:
+  push:
+    branches: [main]
+    paths: [pyproject.toml]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: tag
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read # checks out the repository and reads the tags
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Decide whether to tag
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          version="$(scripts/version.sh)"
+          scripts/check-version.sh "$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if gh api "repos/$REPO/git/ref/tags/v$version" > /dev/null 2>&1; then
+            echo "The tag v$version exists."
+            echo "tag=false" >> "$GITHUB_OUTPUT"
+          elif [ "$(scripts/pypi-wheels.sh "$version")" != true ]; then
+            echo "PyPI has no platform wheels for workflint $version, so it gets no tag."
+            echo "tag=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    name: release
+    needs: plan
+    if: needs.plan.outputs.tag == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    environment: release
+    permissions:
+      contents: write # creates the tag and the release
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - name: Create the tag and the release
+        run: |
+          gh release create "v$VERSION" --repo "$REPO" --target "$GITHUB_SHA" --title "v$VERSION" \
+            --notes "Pins workflint $VERSION. Release notes: https://github.com/stokehold/workflint/releases/tag/v$VERSION"

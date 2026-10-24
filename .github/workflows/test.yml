@@ -1,0 +1,86 @@
+name: Test
+
+# Tests the scripts, audits the workflows, and runs the workflint hook with
+# `pre-commit try-repo` on Linux, macOS, and Windows, against the workflint
+# that pyproject.toml pins on PyPI. The main ruleset requires these checks.
+#
+# The hook tests run only when PyPI has platform wheels for the pinned
+# version. Before workflint 0.1.0, PyPI has only a placeholder, and the
+# release dry run of stokehold/workflint tests the hook with the wheels it
+# builds instead.
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  scripts:
+    name: scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read # checks out the repository
+    outputs:
+      version: ${{ steps.pin.outputs.version }}
+      published: ${{ steps.pin.outputs.published }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test the scripts
+        run: scripts/test.sh
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: shellcheck@0.11.0,zizmor@1.31.0
+      - name: shellcheck
+        run: shellcheck scripts/*.sh
+      - name: zizmor
+        run: zizmor --persona=pedantic --format=github .github/
+        env:
+          GH_TOKEN: ${{ github.token }}
+      - name: Read the pin and check PyPI for it
+        id: pin
+        run: |
+          version="$(scripts/version.sh)"
+          scripts/check-version.sh "$version"
+          published="$(scripts/pypi-wheels.sh "$version")"
+          echo "workflint $version has platform wheels on PyPI: $published"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: test (${{ matrix.runner }})
+    needs: scripts
+    if: needs.scripts.outputs.published == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    permissions:
+      contents: read # checks out the repository
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install pre-commit
+        run: |
+          python -m venv "$RUNNER_TEMP/pre-commit"
+          if [ "$RUNNER_OS" = Windows ]; then bin=Scripts; else bin=bin; fi
+          "$RUNNER_TEMP/pre-commit/$bin/python" -m pip install --only-binary :all: --require-hashes -r requirements-test.txt
+          echo "$RUNNER_TEMP/pre-commit/$bin" >> "$GITHUB_PATH"
+      - name: pre-commit try-repo
+        run: scripts/test-hook.sh . workflint

@@ -1,0 +1,20 @@
+# The Python package that pre-commit installs for the workflint hook. It has
+# no code of its own, only the dependency on the pinned workflint version.
+# scripts/set-version.sh rewrites the pin, and .github/workflows/update.yml
+# runs it on each workflint release.
+[build-system]
+# The same version as scripts/release/requirements-setuptools.txt in
+# stokehold/workflint, whose release dry run builds this package offline.
+requires = ["setuptools==84.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "workflint-pre-commit"
+version = "0"
+description = "The pre-commit hook of workflint, installed from PyPI"
+license = "MIT"
+requires-python = ">=3.9"
+dependencies = ["workflint==0.0.1"]
+
+[tool.setuptools]
+packages = []

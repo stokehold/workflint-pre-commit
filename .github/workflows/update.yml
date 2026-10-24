@@ -1,0 +1,167 @@
+name: Update
+
+# Pins a new workflint version. The release workflow of stokehold/workflint
+# sends a workflint-release event with the version after it publishes to
+# PyPI. A daily run catches a missed event, and a manual run can preview an
+# update.
+#
+# The plan job reads the version to pin: the version of the event, the version
+# input of a manual run, or the latest version on PyPI. It prints the diff of
+# the update. The update job then pins the version on a branch, opens a pull
+# request, and turns on auto-merge. It runs only when the version differs
+# from the pin, PyPI has platform wheels for it, and the run is not a dry run.
+on:
+  repository_dispatch:
+    types: [workflint-release]
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: The version to pin. Empty means the latest version on PyPI.
+        required: false
+        default: ""
+      dry-run:
+        description: Print the diff and open no pull request.
+        type: boolean
+        default: true
+
+permissions: {}
+
+# Runs one at a time, so two runs never open the same pull request.
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read # checks out the repository
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      update: ${{ steps.plan.outputs.update }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Every requested version goes through check-version.sh before any
+      # other use.
+      - name: Choose the version
+        id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          DISPATCHED: ${{ github.event.client_payload.version }}
+          REQUESTED: ${{ inputs.version }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          case "$EVENT" in
+            repository_dispatch) version="$DISPATCHED" ;;
+            workflow_dispatch) version="$REQUESTED" ;;
+            *) version="" ;;
+          esac
+          if [ -z "$version" ]; then
+            version="$(curl -fsSL --retry 3 https://pypi.org/pypi/workflint/json | jq -r .info.version)"
+            echo "The latest workflint on PyPI is $version."
+          fi
+          scripts/check-version.sh "$version"
+          current="$(scripts/version.sh)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$version" = "$current" ]; then
+            echo "The mirror already pins workflint $version."
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          scripts/set-version.sh "$version"
+          echo "The update from $current to $version:"
+          git diff
+          if [ "$DRY_RUN" = true ]; then
+            echo "A dry run opens no pull request."
+            echo "update=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # PyPI can lag a few minutes behind the event of a release.
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if [ "$(scripts/pypi-wheels.sh "$version")" = true ]; then
+              echo "update=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "PyPI has no platform wheels for workflint $version yet (attempt $attempt)."
+            sleep 60
+          done
+          echo "::error::PyPI has no platform wheels for workflint $version."
+          exit 1
+
+  update:
+    name: update
+    needs: plan
+    if: needs.plan.outputs.update == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: automation
+    permissions:
+      contents: read # checks out the repository
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The plan job checked the version, and this job checks it again before
+      # it uses the version.
+      - name: Pin the version
+        run: |
+          scripts/check-version.sh "$VERSION"
+          scripts/set-version.sh "$VERSION"
+          git diff --stat
+      # A pull request that the GITHUB_TOKEN opens starts no workflows, so
+      # the test checks would never run on it.
+      - name: Mint a stokehold-bot token
+        id: token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.STOKEHOLD_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.STOKEHOLD_BOT_PRIVATE_KEY }}
+          repositories: workflint-pre-commit
+          permission-contents: write # pushes the update branch
+          permission-pull-requests: write # opens the pull request and turns on auto-merge
+      # Commits through the GraphQL API, so GitHub signs the commit and the
+      # checkout keeps no credentials. A rerun resets the branch to main.
+      - name: Commit the pin on a branch and open a pull request
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          branch="update/v$VERSION"
+          base="$(git rev-parse HEAD)"
+          if gh api "repos/$REPO/git/ref/heads/$branch" > /dev/null 2>&1; then
+            gh api -X PATCH "repos/$REPO/git/refs/heads/$branch" -f "sha=$base" -F force=true > /dev/null
+          else
+            gh api "repos/$REPO/git/refs" -f "ref=refs/heads/$branch" -f "sha=$base" > /dev/null
+          fi
+          jq -n \
+            --arg repo "$REPO" --arg branch "$branch" --arg base "$base" --arg version "$VERSION" \
+            --arg pyproject "$(base64 -w 0 pyproject.toml)" --arg readme "$(base64 -w 0 README.md)" \
+            '{query: "mutation($input: CreateCommitOnBranchInput!) { createCommitOnBranch(input: $input) { commit { oid } } }",
+              variables: {input: {
+                branch: {repositoryNameWithOwner: $repo, branchName: $branch},
+                expectedHeadOid: $base,
+                message: {headline: "feat: pin workflint \($version)"},
+                fileChanges: {additions: [
+                  {path: "pyproject.toml", contents: $pyproject},
+                  {path: "README.md", contents: $readme}]}}}}' \
+            | gh api graphql --input - --jq '.data.createCommitOnBranch.commit.oid'
+          url="$(gh pr list --repo "$REPO" --head "$branch" --state open --json url --jq '.[0].url // ""')"
+          if [ -z "$url" ]; then
+            url="$(gh pr create --repo "$REPO" --base main --head "$branch" \
+              --title "feat: pin workflint $VERSION" \
+              --body "Pins workflint $VERSION, from https://pypi.org/project/workflint/$VERSION/. When this pull request merges, tag.yml tags the merge commit v$VERSION.")"
+          fi
+          gh pr merge "$url" --auto --squash
+          echo "$url"
